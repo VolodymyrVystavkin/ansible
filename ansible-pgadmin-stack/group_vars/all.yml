@@ -1,0 +1,6 @@
+---
+pgadmin_server_names:
+  - "{{ inventory_hostname }}"
+  - "{{ ansible_host }}"
+postgresql_lab_database: pgadmin_lab
+postgresql_lab_user: pgadmin_lab

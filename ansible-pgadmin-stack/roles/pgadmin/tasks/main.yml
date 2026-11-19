@@ -1,0 +1,196 @@
+---
+- name: Create the root-owned application directory
+  ansible.builtin.file:
+    path: "{{ pgadmin_install_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Record ownership of the application directory
+  ansible.builtin.copy:
+    content: "ansible-pgadmin\n"
+    dest: "{{ pgadmin_install_dir }}/.ansible-pgadmin"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Create a private service group
+  ansible.builtin.group:
+    name: pgadmin-web
+    system: true
+
+- name: Create the service account
+  ansible.builtin.user:
+    name: pgadmin-web
+    group: pgadmin-web
+    home: "{{ pgadmin_state_dir }}"
+    create_home: false
+    shell: /usr/sbin/nologin
+    system: true
+
+- name: Check PostgreSQL utility access before configuring pgAdmin
+  ansible.builtin.import_tasks: verify_binary_paths.yml
+
+- name: Create private application directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: pgadmin-web
+    group: pgadmin-web
+    mode: '0700'
+  loop:
+    - "{{ pgadmin_state_dir }}"
+    - "{{ pgadmin_state_dir }}/sessions"
+    - "{{ pgadmin_state_dir }}/storage"
+    - "{{ pgadmin_log_dir }}"
+
+- name: Create the dedicated virtual environment
+  ansible.builtin.command:
+    argv: [/usr/bin/python3.12, -m, venv, "{{ pgadmin_venv }}"]
+    creates: "{{ pgadmin_venv }}/bin/pip"
+
+- name: Inspect installed wheel versions
+  ansible.builtin.command:
+    argv:
+      - "{{ pgadmin_venv }}/bin/python"
+      - -c
+      - "from importlib.metadata import version; import sys; print(version(sys.argv[1]))"
+      - "{{ item.name }}"
+  loop:
+    - {name: pgadmin4, version: "{{ pgadmin_version }}"}
+    - {name: gunicorn, version: "{{ pgadmin_gunicorn_version }}"}
+  register: pgadmin_wheels
+  failed_when: false
+  changed_when: false
+
+- name: Resolve application packages and dependencies before installation
+  ansible.builtin.command:
+    argv:
+      - "{{ pgadmin_venv }}/bin/python"
+      - -m
+      - pip
+      - --isolated
+      - install
+      - --dry-run
+      - --disable-pip-version-check
+      - --prefer-binary
+      - --only-binary=pgadmin4,gunicorn
+      - "pgadmin4=={{ pgadmin_version }}"
+      - "gunicorn=={{ pgadmin_gunicorn_version }}"
+  changed_when: false
+  when: >-
+    pgadmin_wheels.results[0].rc != 0 or pgadmin_wheels.results[0].stdout != pgadmin_version
+    or pgadmin_wheels.results[1].rc != 0 or pgadmin_wheels.results[1].stdout != pgadmin_gunicorn_version
+  register: pgadmin_install_plan
+
+- name: Install the resolved application packages and dependencies
+  ansible.builtin.command:
+    argv:
+      - "{{ pgadmin_venv }}/bin/python"
+      - -m
+      - pip
+      - --isolated
+      - install
+      - --disable-pip-version-check
+      - --prefer-binary
+      - --only-binary=pgadmin4,gunicorn
+      - "pgadmin4=={{ pgadmin_version }}"
+      - "gunicorn=={{ pgadmin_gunicorn_version }}"
+  when: pgadmin_install_plan is not skipped
+  register: pgadmin_wheel_installation
+
+- name: Validate installed Python dependencies
+  ansible.builtin.command:
+    argv: ["{{ pgadmin_venv }}/bin/python", -m, pip, check]
+  changed_when: false
+
+- name: Locate the installed WSGI module in the pgAdmin wheel metadata
+  ansible.builtin.command:
+    argv:
+      - "{{ pgadmin_venv }}/bin/python"
+      - -c
+      - |
+        import ast
+        from importlib.metadata import distribution
+        wheel = distribution("pgadmin4")
+        entry, = (wheel.locate_file(p).resolve() for p in wheel.files
+                  if str(p) == "pgadmin4/pgAdmin4.py")
+        assert entry.is_relative_to({{ pgadmin_venv | to_json }})
+        assert (entry.parent / "config.py").is_file()
+        assert any(
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "app" for target in node.targets)
+            for node in ast.parse(entry.read_text()).body
+        ), "The wheel does not define the expected WSGI app"
+        print(entry.parent)
+  register: pgadmin_wheel_app
+  changed_when: false
+
+- name: Verify the pgAdmin browser assets
+  ansible.builtin.import_tasks: frontend.yml
+
+- name: Deploy pgAdmin server configuration
+  ansible.builtin.template:
+    src: config_local.py.j2
+    dest: "{{ pgadmin_wheel_app.stdout }}/config_local.py"
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+    validate: >-
+      {{ pgadmin_venv }}/bin/python -c
+      'import ast,sys; ast.parse(open(sys.argv[1]).read())' %s
+  register: pgadmin_config
+
+- name: Install the bootstrap helper
+  ansible.builtin.copy:
+    src: bootstrap.py
+    dest: "{{ pgadmin_install_dir }}/bootstrap.py"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Initialize an administrator and publish the database only if absent
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - pgadmin-web
+      - --
+      - "{{ pgadmin_venv }}/bin/python"
+      - "{{ pgadmin_install_dir }}/bootstrap.py"
+      - "{{ pgadmin_wheel_app.stdout }}"
+      - "{{ pgadmin_sqlite }}"
+    stdin: "{{ [vault_pgadmin_admin_email, vault_pgadmin_admin_password] | to_json }}"
+    chdir: "{{ pgadmin_wheel_app.stdout }}"
+    creates: "{{ pgadmin_sqlite }}"
+  register: pgadmin_bootstrap
+  failed_when: false
+  changed_when: pgadmin_bootstrap.rc == 0 and pgadmin_bootstrap.msg | default('') == ''
+  no_log: true
+  when: not pgadmin_database_preflight.stat.exists
+
+- name: Report pgAdmin bootstrap failures without exposing credentials
+  ansible.builtin.assert:
+    that: pgadmin_bootstrap.rc | default(1) == 0
+    quiet: true
+    fail_msg: >-
+      pgAdmin bootstrap failed.
+      {{ {
+        20: 'pgAdmin could not access an application file or directory.',
+        21: 'pgAdmin could not import the application or a Python dependency.',
+        22: 'pgAdmin failed during startup or database initialization. Review its private application log on the VM.',
+        23: 'The pgAdmin WSGI entry point is not callable.',
+        24: 'SQLite did not contain the expected active administrator.',
+        25: 'SQLite used WAL mode during bootstrap.'
+      }.get(pgadmin_bootstrap.rc | default(1), 'The bootstrap command or SQLite verification failed.') }}
+  when: not pgadmin_database_preflight.stat.exists
+
+- name: Enforce private SQLite database permissions
+  ansible.builtin.file:
+    path: "{{ pgadmin_sqlite }}"
+    state: file
+    owner: pgadmin-web
+    group: pgadmin-web
+    mode: '0600'

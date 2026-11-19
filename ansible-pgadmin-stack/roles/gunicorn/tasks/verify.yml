@@ -1,0 +1,13 @@
+---
+- name: Verify pgAdmin serves the login page over the Unix socket
+  ansible.builtin.uri:
+    url: http://localhost/login
+    unix_socket: "{{ pgadmin_socket_path }}"
+    use_proxy: false
+    return_content: true
+    follow_redirects: none
+  register: pgadmin_socket_probe
+  no_log: true
+  until: pgadmin_socket_probe.status == 200 and 'csrfToken' in (pgadmin_socket_probe.content | default(''))
+  retries: 12
+  delay: 3

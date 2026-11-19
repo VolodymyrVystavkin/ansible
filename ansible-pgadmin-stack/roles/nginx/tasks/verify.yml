@@ -1,0 +1,83 @@
+---
+- name: Check the active pgAdmin route
+  vars:
+    pgadmin_probe_scheme: "{{ 'https' if pgadmin_use_https | bool else 'http' }}"
+    pgadmin_probe_port: "{{ pgadmin_https_port if pgadmin_use_https | bool else pgadmin_listen_port }}"
+  block:
+    - name: Probe the pgAdmin login page through Nginx
+      ansible.builtin.command:
+        argv: >-
+          {{
+            ['curl', '--disable', '--noproxy', '*', '--silent', '--show-error',
+             '--fail-with-body', '--http1.1', '--include', '--max-time', '10',
+             '--connect-to', pgadmin_probe_name ~ ':' ~ pgadmin_probe_port ~ ':127.0.0.1:' ~ pgadmin_probe_port,
+             '--header', 'X-Script-Name: /untrusted',
+             '--header', 'X-Scheme: invalid',
+             '--header', 'X-Forwarded-Host: untrusted.invalid',
+             '--header', 'X-Forwarded-Proto: invalid']
+            + ([] if pgadmin_probe_validate_certs | bool else ['--insecure'])
+            + [pgadmin_probe_scheme ~ '://' ~ pgadmin_probe_name ~ ':' ~ pgadmin_probe_port ~ '/login']
+          }}
+      register: pgadmin_http_probe
+      changed_when: false
+      until:
+        - pgadmin_http_probe.rc == 0
+        - pgadmin_http_probe.stdout is search('(?im)^HTTP/1[.][01] 200[ ]')
+        - pgadmin_http_probe.stdout is search('(?im)^X-Pgadmin-Proxy:\s*ansible-pgadmin\s*$')
+        - "'csrfToken' in pgadmin_http_probe.stdout"
+        - "'/untrusted' not in pgadmin_http_probe.stdout"
+        - "'untrusted.invalid' not in pgadmin_http_probe.stdout"
+      retries: 6
+      delay: 2
+      no_log: true
+  rescue:
+    - name: Report the failed Nginx login probe without response data
+      vars:
+        pgadmin_probe_response: "{{ pgadmin_http_probe.stdout | default('') }}"
+        pgadmin_probe_statuses: "{{ pgadmin_probe_response | regex_findall('(?m)^HTTP/[0-9.]+ ([0-9]{3})') }}"
+      ansible.builtin.fail:
+        msg: >-
+          Login check for {{ pgadmin_probe_name }} failed.
+          HTTP status {{ pgadmin_probe_statuses | last | default('unavailable') }},
+          curl exit {{ pgadmin_http_probe.rc | default('unavailable') }},
+          proxy marker {{ 'present' if (pgadmin_probe_response is search('(?im)^X-Pgadmin-Proxy:[ \t]*ansible-pgadmin[ \t]*\r?$')) else 'missing' }},
+          login marker {{ 'present' if 'csrfToken' in pgadmin_probe_response else 'missing' }},
+          test header reflected {{ 'yes' if ('/untrusted' in pgadmin_probe_response or 'untrusted.invalid' in pgadmin_probe_response) else 'no' }}.
+
+- name: Verify pgAdmin serves its login JavaScript and stylesheet through Nginx
+  vars:
+    pgadmin_probe_scheme: "{{ 'https' if pgadmin_use_https | bool else 'http' }}"
+    pgadmin_probe_port: "{{ pgadmin_https_port if pgadmin_use_https | bool else pgadmin_listen_port }}"
+  ansible.builtin.command:
+    argv: >-
+      {{
+        ['curl', '--disable', '--noproxy', '*', '--silent', '--show-error',
+         '--head', '--output', '/dev/null', '--max-time', '10',
+         '--write-out', '%{http_code} %{content_type}',
+         '--connect-to', pgadmin_probe_name ~ ':' ~ pgadmin_probe_port ~ ':127.0.0.1:' ~ pgadmin_probe_port]
+        + ([] if pgadmin_probe_validate_certs | bool else ['--insecure'])
+        + [pgadmin_probe_scheme ~ '://' ~ pgadmin_probe_name ~ ':' ~ pgadmin_probe_port ~
+           '/static/js/generated/' ~ item.file]
+      }}
+  loop:
+    - {file: security.pages.js, mime: '^200 (application|text)/javascript([;]|$)'}
+    - {file: style.css, mime: '^200 text/css([;]|$)'}
+  loop_control:
+    label: "{{ item.file }}"
+  register: pgadmin_asset_probe
+  changed_when: false
+  failed_when: pgadmin_asset_probe.rc != 0 or pgadmin_asset_probe.stdout is not match(item.mime)
+
+- name: Verify HTTP redirects to the configured HTTPS authority
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ pgadmin_listen_port }}/login"
+    headers:
+      Host: "{{ pgadmin_probe_name }}"
+    follow_redirects: none
+    status_code: 308
+    use_proxy: false
+  register: pgadmin_tls_redirect
+  failed_when: >-
+    (pgadmin_tls_redirect.location | default('')) !=
+    ('https://' ~ pgadmin_probe_name ~ ('' if pgadmin_https_port | int == 443 else ':' ~ pgadmin_https_port) ~ '/login')
+  when: pgadmin_use_https | bool

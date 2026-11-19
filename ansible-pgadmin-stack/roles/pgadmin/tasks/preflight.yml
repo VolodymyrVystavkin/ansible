@@ -1,0 +1,211 @@
+---
+- name: Validate supported OS and architecture
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution == 'Ubuntu'
+      - ansible_facts.distribution_version == '24.04'
+      - ansible_facts.architecture in ['x86_64', 'aarch64']
+      - ansible_facts.service_mgr == 'systemd'
+
+- name: Validate deployment settings
+  ansible.builtin.assert:
+    that:
+      - pgadmin_server_names | length > 0
+      - pgadmin_server_names is sequence and pgadmin_server_names is not string
+      - pgadmin_server_names | reject('match', '^[A-Za-z0-9][A-Za-z0-9.-]*$') | list | length == 0
+      - pgadmin_listen_port | int in range(1, 65536)
+      - pgadmin_listen_port | int not in [5050, 5432]
+      - pgadmin_https_port | int in range(1, 65536)
+      - pgadmin_https_port | int not in [5050, 5432]
+      - not (pgadmin_use_https | bool) or (pgadmin_listen_port | int != pgadmin_https_port | int)
+      - not (pgadmin_use_https | bool) or (pgadmin_tls_certificate is match('^/[A-Za-z0-9_./-]+$') and pgadmin_tls_private_key is match('^/[A-Za-z0-9_./-]+$'))
+      - pgadmin_gunicorn_threads | int in range(2, 65)
+      - pgadmin_nginx_max_body_size is match('^[1-9][0-9]*[kKmMgG]?$')
+      - pgadmin_nginx_proxy_timeout | int in range(1, 3601)
+      - pgadmin_version is match('^[0-9]+(\.[0-9]+)+$')
+      - pgadmin_gunicorn_version is match('^[0-9]+(\.[0-9]+)+$')
+      - pgadmin_socket_path is match('^/run/pgadmin-gunicorn/[A-Za-z0-9_.-]+\.sock$')
+      - pgadmin_socket_path | length < 100
+      - pgadmin_install_dir is match('^/opt/[A-Za-z0-9_-]+$')
+      - pgadmin_state_dir is match('^/var/lib/[A-Za-z0-9_-]+$')
+      - pgadmin_log_dir is match('^/var/log/[A-Za-z0-9_-]+$')
+      - pgadmin_venv == pgadmin_install_dir ~ '/venv'
+      - pgadmin_sqlite == pgadmin_state_dir ~ '/pgadmin4.db'
+      - pgadmin_nginx_worker_user is match('^[a-z_][a-z0-9_-]*$')
+      - pgadmin_nginx_worker_group is match('^[a-z_][a-z0-9_-]*$')
+
+- name: Inspect local software and listener state without changing the host
+  ansible.builtin.shell: |
+    set -eu
+    printf '\nPython\n'
+    /usr/bin/python3 --version
+    printf '\nDisk space (KiB)\n'
+    df -Pk / /opt /var/lib /var/log /tmp
+    printf '\nInstalled packages and cached APT origins\n'
+    dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package} ${Version}\n' 'pgadmin*' 'nginx*' 'apache2*' 'gunicorn*' 'postgresql*' 'python3*-venv' 2>/dev/null || true
+    apt-cache policy nginx python3.12-venv python3-psycopg2 pgadmin4 pgadmin4-server pgadmin4-web apache2 gunicorn postgresql
+    printf '\nPostgreSQL version and clusters\n'
+    if command -v psql >/dev/null; then psql --version; fi
+    if command -v pg_lsclusters >/dev/null; then pg_lsclusters; fi
+    printf '\nService and socket units\n'
+    systemctl list-unit-files --no-pager 'postgresql*' 'apache2*' 'nginx*' '*gunicorn*' '*pgadmin*'
+    for unit in postgresql nginx apache2 gunicorn pgadmin pgadmin-gunicorn; do
+      printf '%s ' "$unit"
+      systemctl is-active "$unit" || true
+    done
+    printf '\nTCP listeners\n'
+    ss -H -ltnp '( sport = :80 or sport = :443 or sport = :5050 or sport = :5432 or sport = :{{ pgadmin_listen_port | int }} or sport = :{{ pgadmin_https_port | int }} )'
+    printf '\nRelevant Unix listeners\n'
+    ss -H -lxnp | awk 'tolower($0) ~ /pgadmin|gunicorn/'
+    printf '\nEnabled sites and common pgAdmin paths (metadata only)\n'
+    for path in /etc/nginx/sites-enabled /etc/apache2/sites-enabled /etc/apache2/conf-enabled /usr/pgadmin4 /etc/pgadmin /var/lib/pgadmin /var/log/pgadmin; do
+      if test -e "$path"; then ls -ld "$path"; ls -l "$path"; fi
+    done
+    for path in /opt /srv /var/www /usr/local/lib /home; do
+      if test -d "$path"; then
+        find "$path" -maxdepth 6 \( -iname pgAdmin4.py -o -name pgadmin4.db -o -iname '*pgadmin*venv*' -o -name gunicorn -o -name config_local.py -o -name config_system.py \) -print
+      fi
+    done
+    if dpkg-query -W -f='${db:Status-Abbrev}' apache2 2>/dev/null | grep -q '^ii'; then
+      printf '\nInstalled packages depending on Apache\n'
+      apt-cache --installed rdepends apache2
+    fi
+  register: pgadmin_inventory
+  changed_when: false
+  check_mode: false
+
+- name: Show preflight inventory
+  ansible.builtin.debug:
+    var: pgadmin_inventory.stdout_lines
+
+- name: Inspect current Nginx configuration privately
+  ansible.builtin.command: nginx -T
+  register: pgadmin_nginx_current
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+  when: "'ii  nginx ' in pgadmin_inventory.stdout or '/etc/nginx/sites-enabled' in pgadmin_inventory.stdout"
+
+- name: Check whether the existing Nginx configuration is usable
+  ansible.builtin.assert:
+    that:
+      - pgadmin_nginx_current.rc == 0
+      - pgadmin_nginx_current.stderr is not search('conflicting server name')
+    fail_msg: Existing Nginx configuration needs review. Run sudo nginx -t on the VM.
+  when: pgadmin_nginx_current is not skipped
+
+- name: Check local Python and disk prerequisites
+  ansible.builtin.shell: |
+    set -eu
+    /usr/bin/python3 -c 'import sys; assert sys.version_info[:2] == (3, 12)'
+    df -Pk /opt /var/lib /var/log /tmp |
+      awk -v minimum={{ pgadmin_min_free_kib | int }} 'NR > 1 && $4 < minimum { bad = 1 } END { exit bad }'
+  changed_when: false
+  check_mode: false
+
+- name: Identify installation and port conflicts
+  ansible.builtin.shell: |
+    set -eu
+    if dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 'pgadmin*' 2>/dev/null | grep -q '^ii'; then
+      echo 'Installed pgAdmin APT package requires an explicit migration decision.'
+      exit 1
+    fi
+    for path in /usr/pgadmin4 /etc/pgadmin /var/lib/pgadmin /var/log/pgadmin /run/pgadmin /etc/systemd/system/pgadmin.service /etc/systemd/system/pgadmin4.service; do
+      if test -e "$path" || test -L "$path"; then
+        printf 'Existing pgAdmin path requires review: %s\n' "$path"
+        exit 1
+      fi
+    done
+    for path in /opt /srv /var/www /usr/local/lib /home; do
+      if test -d "$path"; then
+        find "$path" -maxdepth 6 -path {{ pgadmin_install_dir | quote }} -prune -o \
+          \( -iname pgAdmin4.py -o -name pgadmin4.db -o -iname '*pgadmin*venv*' \) -print
+      fi
+    done
+    if systemctl is-active --quiet pgadmin pgadmin4 pgadmin.socket pgadmin4.socket; then
+      echo 'An existing pgAdmin unit is active.'
+    fi
+    ss -H -ltnp '( sport = :{{ pgadmin_listen_port | int }}{% if pgadmin_use_https | bool %} or sport = :{{ pgadmin_https_port | int }}{% endif %} )' |
+      awk '$0 !~ /"nginx"/ { print "Non-Nginx listener owns a requested port: " $0 }'
+    ss -H -ltnp '( sport = :5050 )' |
+      awk '{ print "Existing port 5050 listener requires review: " $0 }'
+    ss -H -ltn '( sport = :5432 )' |
+      awk '$4 !~ /^(127\.[0-9.]+|\[::1\]):5432$/ { print "Non-loopback PostgreSQL listener requires review: " $4 }'
+  register: pgadmin_conflicts
+  changed_when: false
+  failed_when: pgadmin_conflicts.rc != 0 or pgadmin_conflicts.stdout | length > 0
+  check_mode: false
+
+- name: Inspect managed paths and their ownership markers
+  ansible.builtin.shell: |
+    set -eu
+    if test -e {{ pgadmin_install_dir | quote }}/.ansible-pgadmin; then
+      test ! -L {{ pgadmin_install_dir | quote }}
+      test -f {{ pgadmin_install_dir | quote }}/.ansible-pgadmin
+      test "$(cat {{ pgadmin_install_dir | quote }}/.ansible-pgadmin)" = 'ansible-pgadmin'
+    else
+      for path in {{ pgadmin_install_dir | quote }} {{ pgadmin_state_dir | quote }} {{ pgadmin_log_dir | quote }} /etc/systemd/system/pgadmin-gunicorn.service; do
+        if test -e "$path" || test -L "$path"; then
+          printf 'Unmanaged deployment path requires review: %s\n' "$path"
+          exit 1
+        fi
+      done
+      if getent passwd pgadmin-web >/dev/null; then
+        echo 'Existing pgadmin-web account requires review.'
+        exit 1
+      fi
+    fi
+    test ! -L {{ pgadmin_state_dir | quote }}
+    test ! -L {{ pgadmin_log_dir | quote }}
+    test ! -L {{ pgadmin_venv | quote }}
+    test ! -L {{ pgadmin_sqlite | quote }}
+    if test -e {{ pgadmin_sqlite | quote }}; then
+      test -s {{ pgadmin_sqlite | quote }}
+      test -x {{ pgadmin_venv | quote }}/bin/python
+      {{ pgadmin_venv | quote }}/bin/python -c 'from importlib.metadata import version; import sys; sys.exit(version("pgadmin4") != sys.argv[1])' {{ pgadmin_version | quote }}
+    fi
+  changed_when: false
+  check_mode: false
+
+- name: Inspect TLS inputs before changes
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+  loop:
+    - "{{ pgadmin_tls_certificate }}"
+    - "{{ pgadmin_tls_private_key }}"
+  register: pgadmin_tls_inputs
+  failed_when: not (pgadmin_tls_inputs.stat.isreg | default(false))
+  when: pgadmin_use_https | bool
+
+- name: Check whether the managed application database exists
+  ansible.builtin.stat:
+    path: "{{ pgadmin_sqlite }}"
+  register: pgadmin_database_preflight
+
+- name: Require the initial pgAdmin variable names in the new Vault
+  ansible.builtin.assert:
+    that:
+      - vault_pgadmin_admin_email is defined
+      - vault_pgadmin_admin_password is defined
+    fail_msg: Create or edit group_vars/all/vault.yml as described in README.md.
+  when:
+    - not pgadmin_database_preflight.stat.exists
+    - not pgadmin_preflight_only | bool
+
+- name: Validate the Vault credentials privately for fresh deployment
+  ansible.builtin.assert:
+    that:
+      - vault_pgadmin_admin_email | default('') is match('^[^\s@]+@[^\s@]+\.[^\s@]+$')
+      - vault_pgadmin_admin_password is string
+      - vault_pgadmin_admin_password | length >= 12
+  no_log: true
+  when:
+    - not pgadmin_database_preflight.stat.exists
+    - not pgadmin_preflight_only | bool
+
+- name: Explain dry-run scope
+  ansible.builtin.debug:
+    msg: "Preflight completed. Check mode skips package resolution, file activation, bootstrap, systemd operations, and live HTTP probes."
+  when: ansible_check_mode

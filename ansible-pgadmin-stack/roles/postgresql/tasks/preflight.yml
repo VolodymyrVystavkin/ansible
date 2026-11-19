@@ -1,0 +1,27 @@
+---
+- name: Validate PostgreSQL lab object names
+  ansible.builtin.assert:
+    that:
+      - postgresql_lab_database is match('^[a-z][a-z0-9_]{0,62}$')
+      - postgresql_lab_user is match('^[a-z][a-z0-9_]{0,62}$')
+      - postgresql_lab_database not in ['postgres', 'template0', 'template1']
+      - postgresql_lab_user != 'postgres'
+      - not postgresql_lab_user.startswith('pg_')
+
+- name: Check the existing PostgreSQL cluster configuration
+  ansible.builtin.include_tasks: inspect.yml
+  tags: [always, preflight]
+
+- name: Require the PostgreSQL variable name in the new Vault
+  ansible.builtin.assert:
+    that: vault_postgresql_lab_password is defined
+    fail_msg: Create or edit group_vars/all/vault.yml as described in README.md.
+  when: not pgadmin_preflight_only | bool
+
+- name: Validate the PostgreSQL Vault password privately
+  ansible.builtin.assert:
+    that:
+      - vault_postgresql_lab_password | default('') is string
+      - vault_postgresql_lab_password | default('') | length >= 12
+  no_log: true
+  when: not pgadmin_preflight_only | bool

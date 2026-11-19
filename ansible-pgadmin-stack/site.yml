@@ -1,0 +1,31 @@
+---
+- name: Provision the PostgreSQL and pgAdmin stack
+  hosts: database
+  become: true
+  gather_facts: true
+  serial: 1
+
+  pre_tasks:
+    - name: Inspect the host before changing it
+      ansible.builtin.import_role:
+        name: pgadmin
+        tasks_from: preflight
+      tags: [always, preflight]
+
+    - name: Inspect existing PostgreSQL clusters and lab credentials
+      ansible.builtin.import_role:
+        name: postgresql
+        tasks_from: preflight
+      tags: [always, preflight]
+
+  roles:
+    - role: common
+      when: not (pgadmin_preflight_only | bool or ansible_check_mode)
+    - role: postgresql
+      when: not (pgadmin_preflight_only | bool or ansible_check_mode)
+    - role: pgadmin
+      when: not (pgadmin_preflight_only | bool or ansible_check_mode)
+    - role: gunicorn
+      when: not (pgadmin_preflight_only | bool or ansible_check_mode)
+    - role: nginx
+      when: not (pgadmin_preflight_only | bool or ansible_check_mode)

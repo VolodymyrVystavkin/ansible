@@ -1,0 +1,6 @@
+.vault-pass*
+*.retry
+.venv/
+__pycache__/
+collections/
+group_vars/all/vault.yml

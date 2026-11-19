@@ -1,0 +1,63 @@
+---
+- name: Install PostgreSQL when the host has no existing cluster
+  ansible.builtin.apt:
+    name: "{{ postgresql_package }}"
+    state: present
+    install_recommends: false
+    lock_timeout: 120
+    policy_rc_d: 101
+  when: postgresql_cluster.stdout == 'absent'
+
+- name: Recheck cluster settings before starting PostgreSQL
+  ansible.builtin.include_tasks: inspect.yml
+
+- name: Require an installed cluster
+  ansible.builtin.assert:
+    that: postgresql_cluster.stdout != 'absent'
+    fail_msg: The Ubuntu package setup did not create its default cluster.
+
+- name: Discover the matching PostgreSQL client paths
+  ansible.builtin.import_tasks: client_paths.yml
+
+- name: Ensure the matching PostgreSQL client package is installed
+  ansible.builtin.apt:
+    name: "postgresql-client-{{ postgresql_client_major }}"
+    state: present
+    install_recommends: false
+    lock_timeout: 120
+
+- name: Enable and start PostgreSQL
+  ansible.builtin.systemd_service:
+    name: postgresql
+    enabled: true
+    state: started
+
+- name: Wait for PostgreSQL to accept local TCP connections
+  ansible.builtin.command: pg_isready -h 127.0.0.1 -p 5432
+  register: postgresql_ready
+  until: postgresql_ready.rc == 0
+  retries: 6
+  delay: 2
+  changed_when: false
+
+- name: Verify PostgreSQL only listens on loopback
+  ansible.builtin.shell: |
+    set -eu
+    ss -H -ltn 'sport = :5432' |
+      awk '$4 !~ /^(127\.[0-9.]+|\[::1\]):5432$/ { bad = 1 } END { exit bad }'
+  changed_when: false
+
+- name: Provision lab objects and grant database creation through the local PostgreSQL connection
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - postgres
+      - --
+      - /usr/bin/python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', role_path ~ '/files/provision_lab.py') }}"
+    stdin: "{{ [postgresql_lab_user, postgresql_lab_database, vault_postgresql_lab_password] | to_json }}"
+  register: postgresql_lab_provision
+  changed_when: postgresql_lab_provision.stdout == 'changed'
+  no_log: true

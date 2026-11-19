@@ -1,0 +1,4 @@
+---
+postgresql_package: postgresql
+postgresql_lab_user: pgadmin_lab
+postgresql_lab_database: pgadmin_lab

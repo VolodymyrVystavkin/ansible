@@ -1,0 +1,52 @@
+# Managed by Ansible for pgAdmin (site.yml)
+{% if pgadmin_use_https | bool %}
+server {
+    listen {{ pgadmin_listen_port | int }};
+    server_name {{ pgadmin_server_names | unique | join(' ') }};
+    server_tokens off;
+    if ($host !~* "^({{ pgadmin_server_names | unique | map('regex_escape') | join('|') }})$") {
+        return 421;
+    }
+    return 308 https://$host{{ '' if pgadmin_https_port | int == 443 else ':' ~ (pgadmin_https_port | int) }}$request_uri;
+}
+
+{% endif %}
+server {
+{% if pgadmin_use_https | bool %}
+    listen {{ pgadmin_https_port | int }} ssl;
+    ssl_certificate {{ pgadmin_tls_certificate }};
+    ssl_certificate_key {{ pgadmin_tls_private_key }};
+    ssl_protocols TLSv1.2 TLSv1.3;
+{% else %}
+    listen {{ pgadmin_listen_port | int }};
+{% endif %}
+    server_name {{ pgadmin_server_names | unique | join(' ') }};
+    server_tokens off;
+    if ($host !~* "^({{ pgadmin_server_names | unique | map('regex_escape') | join('|') }})$") {
+        return 421;
+    }
+    client_max_body_size {{ pgadmin_nginx_max_body_size }};
+
+    location / {
+        proxy_pass http://unix:{{ pgadmin_socket_path }};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Port "";
+        proxy_set_header X-Forwarded-Prefix "";
+        proxy_set_header X-Script-Name "";
+        proxy_set_header X-Scheme "";
+        proxy_set_header SCRIPT_NAME "";
+        proxy_set_header PATH_INFO "";
+        proxy_set_header X-Forwarded-Protocol "";
+        proxy_set_header X-Forwarded-SSL "";
+        proxy_set_header Forwarded "";
+        proxy_connect_timeout 5s;
+        proxy_read_timeout {{ pgadmin_nginx_proxy_timeout | int }}s;
+        proxy_send_timeout {{ pgadmin_nginx_proxy_timeout | int }}s;
+        add_header X-Pgadmin-Proxy ansible-pgadmin always;
+    }
+}

@@ -1,0 +1,53 @@
+---
+- name: Inspect the installed pgAdmin frontend
+  ansible.builtin.stat:
+    path: "{{ pgadmin_wheel_app.stdout }}/pgadmin/static/js/generated/{{ item }}"
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop:
+    - security.pages.js
+    - vendor.react.js
+    - vendor.main.js
+    - vendor.others.js
+    - vendor.sqleditor.js
+    - pgadmin_commons.js
+    - style.css
+  register: pgadmin_frontend
+
+- name: Repair the missing frontend of the official pgAdmin 9.19 wheel
+  when:
+    - pgadmin_version == '9.19'
+    - pgadmin_frontend.results | rejectattr('stat.exists') | list | length > 0
+  block:
+    - name: Download the matching official Ubuntu archive for its frontend files
+      ansible.builtin.get_url:
+        url: https://ftp.postgresql.org/pub/pgadmin/pgadmin4/apt/noble/dists/pgadmin4/main/binary-amd64/pgadmin4-server_9.19-1.noble_amd64.deb
+        checksum: sha256:03b4baf0f48b9eebcf3676004bf02dce02aee8b8a93bbc0736dd85e7a930e0e1
+        dest: "{{ pgadmin_install_dir }}/pgadmin4-server-9.19-frontend.deb"
+        owner: root
+        group: root
+        mode: '0600'
+        timeout: 120
+
+    - name: Copy only the generated browser assets into the managed wheel directory
+      ansible.builtin.shell: |
+        set -euo pipefail
+        stage=$(mktemp -d)
+        trap 'rm -rf -- "$stage"' EXIT
+        member=./usr/pgadmin4/web/pgadmin/static/js/generated
+        dpkg-deb --fsys-tarfile {{ (pgadmin_install_dir ~ '/pgadmin4-server-9.19-frontend.deb') | quote }} |
+          tar -xf - -C "$stage" "$member"
+        destination={{ (pgadmin_wheel_app.stdout ~ '/pgadmin/static/js/generated') | quote }}
+        install -d -m 0755 "$destination"
+        cp -a --no-preserve=ownership "$stage/$member/." "$destination/"
+      args:
+        executable: /bin/bash
+
+- name: Require the browser assets before starting pgAdmin
+  ansible.builtin.command:
+    argv: [test, -s, "{{ pgadmin_wheel_app.stdout }}/pgadmin/static/js/generated/{{ item.item }}"]
+  loop: "{{ pgadmin_frontend.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  changed_when: false

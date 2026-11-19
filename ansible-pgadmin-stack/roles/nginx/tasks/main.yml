@@ -1,0 +1,223 @@
+---
+- name: Install Nginx without starting its package default site
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+    cache_valid_time: 86400
+    lock_timeout: 120
+    policy_rc_d: 101
+
+- name: Verify Nginx worker can read the login page through the private socket
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - "{{ pgadmin_nginx_worker_user }}"
+      - --
+      - curl
+      - --disable
+      - --noproxy
+      - '*'
+      - --silent
+      - --show-error
+      - --fail
+      - --max-time
+      - '10'
+      - --unix-socket
+      - "{{ pgadmin_socket_path }}"
+      - http://localhost/login
+  register: pgadmin_nginx_socket
+  no_log: true
+  changed_when: false
+  failed_when: pgadmin_nginx_socket.rc != 0 or 'csrfToken' not in pgadmin_nginx_socket.stdout
+
+- name: Inspect the reserved Nginx site path
+  ansible.builtin.stat:
+    path: /etc/nginx/sites-enabled/zz-ansible-pgadmin.conf
+  register: pgadmin_nginx_previous
+
+- name: Require a regular file at the reserved site path
+  ansible.builtin.assert:
+    that: pgadmin_nginx_previous.stat.isreg
+    fail_msg: The reserved Nginx site path is already in use. Review it before deployment.
+  when: pgadmin_nginx_previous.stat.exists
+
+- name: Check the existing site for its ownership marker
+  ansible.builtin.command:
+    argv:
+      - head
+      - -n
+      - '1'
+      - /etc/nginx/sites-enabled/zz-ansible-pgadmin.conf
+  register: pgadmin_nginx_marker
+  changed_when: false
+  failed_when: pgadmin_nginx_marker.rc != 0 or pgadmin_nginx_marker.stdout != '# Managed by Ansible for pgAdmin (site.yml)'
+  when: pgadmin_nginx_previous.stat.exists
+
+- name: Record the initial Nginx service state
+  ansible.builtin.command: systemctl is-active nginx
+  register: pgadmin_nginx_running
+  failed_when: pgadmin_nginx_running.rc not in [0, 3]
+  changed_when: false
+
+- name: Create a private directory for Nginx validation
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: ansible-pgadmin-nginx-
+  register: pgadmin_nginx_stage
+  changed_when: false
+
+- name: Stage and deploy the verified Nginx site
+  block:
+    - name: Render pgAdmin site in the staging directory
+      ansible.builtin.template:
+        src: pgadmin.conf.j2
+        dest: "{{ pgadmin_nginx_stage.path }}/zz-ansible-pgadmin.conf"
+        mode: '0644'
+      changed_when: false
+
+    - name: Read the staged file checksum
+      ansible.builtin.stat:
+        path: "{{ pgadmin_nginx_stage.path }}/zz-ansible-pgadmin.conf"
+      register: pgadmin_nginx_candidate
+
+    - name: Determine whether the site needs activation
+      ansible.builtin.set_fact:
+        pgadmin_nginx_site_changed: "{{ pgadmin_nginx_candidate.stat.checksum != (pgadmin_nginx_previous.stat.checksum | default('')) }}"
+
+    - name: Validate the full configuration with the staged site
+      ansible.builtin.command:
+        argv:
+          - unshare
+          - --mount
+          - --propagation
+          - private
+          - /bin/sh
+          - -eu
+          - -c
+          - |
+            mkdir "$1/sites-enabled"
+            cp -a /etc/nginx/sites-enabled/. "$1/sites-enabled/"
+            cp "$1/zz-ansible-pgadmin.conf" "$1/sites-enabled/zz-ansible-pgadmin.conf"
+            mount --bind "$1/sites-enabled" /etc/nginx/sites-enabled
+            # Check syntax and confirm nginx.conf actually includes the new site.
+            nginx -t
+            nginx -T > "$1/effective.conf"
+            grep -Fxq '# configuration file /etc/nginx/sites-enabled/zz-ansible-pgadmin.conf:' "$1/effective.conf"
+          - nginx-candidate
+          - "{{ pgadmin_nginx_stage.path }}"
+      register: pgadmin_nginx_validation
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when: pgadmin_nginx_site_changed
+
+    - name: Reject an invalid or conflicting candidate before touching the live site
+      ansible.builtin.assert:
+        that:
+          - pgadmin_nginx_validation.rc == 0
+          - pgadmin_nginx_validation.stderr is not search('conflicting server name')
+        fail_msg: >-
+          The complete Nginx candidate failed validation. Check server names, includes,
+          certificates and mount namespace support. The live site has not been modified.
+      when: pgadmin_nginx_site_changed
+
+    - name: Create the Nginx backup directory outside all server includes
+      ansible.builtin.file:
+        path: /var/backups/ansible-pgadmin
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: pgadmin_nginx_site_changed and pgadmin_nginx_previous.stat.exists
+
+    - name: Back up the previous site before replacing it
+      ansible.builtin.copy:
+        src: /etc/nginx/sites-enabled/zz-ansible-pgadmin.conf
+        dest: "/var/backups/ansible-pgadmin/nginx-{{ ansible_facts.date_time.iso8601_basic_short }}-{{ pgadmin_nginx_stage.path | basename }}.conf"
+        remote_src: true
+        mode: '0600'
+      register: pgadmin_nginx_backup
+      when: pgadmin_nginx_site_changed and pgadmin_nginx_previous.stat.exists
+
+    - name: Activate and verify the site
+      block:
+        - name: Install validated pgAdmin site atomically
+          ansible.builtin.copy:
+            src: "{{ pgadmin_nginx_stage.path }}/zz-ansible-pgadmin.conf"
+            dest: /etc/nginx/sites-enabled/zz-ansible-pgadmin.conf
+            remote_src: true
+            owner: root
+            group: root
+            mode: '0644'
+          register: pgadmin_nginx_live
+          notify: Reload pgAdmin Nginx configuration
+          when: pgadmin_nginx_site_changed
+
+        - name: Ensure Nginx is running
+          ansible.builtin.systemd_service:
+            name: nginx
+            state: started
+
+        - name: Apply Nginx handler before probing
+          ansible.builtin.meta: flush_handlers
+
+        - name: Confirm the requested reload succeeded
+          ansible.builtin.assert:
+            that: pgadmin_nginx_reload.rc == 0
+            fail_msg: "{{ pgadmin_nginx_reload.stderr }}"
+          when: pgadmin_nginx_live is changed
+
+        - name: Verify the running virtual host
+          ansible.builtin.include_tasks: verify_site.yml
+
+        - name: Enable the verified Nginx service on boot
+          ansible.builtin.systemd_service:
+            name: nginx
+            enabled: true
+
+      rescue:
+        - name: Restore the previous site from its backup
+          ansible.builtin.copy:
+            src: "{{ pgadmin_nginx_backup.dest }}"
+            dest: /etc/nginx/sites-enabled/zz-ansible-pgadmin.conf
+            remote_src: true
+            owner: "{{ pgadmin_nginx_previous.stat.uid | string }}"
+            group: "{{ pgadmin_nginx_previous.stat.gid | string }}"
+            mode: "{{ pgadmin_nginx_previous.stat.mode }}"
+          when: pgadmin_nginx_live is changed and pgadmin_nginx_previous.stat.exists
+
+        - name: Remove the new site after unsuccessful activation
+          ansible.builtin.file:
+            path: /etc/nginx/sites-enabled/zz-ansible-pgadmin.conf
+            state: absent
+          when: pgadmin_nginx_live is changed and not pgadmin_nginx_previous.stat.exists
+
+        - name: Discard Nginx runtime changes if it was initially stopped
+          ansible.builtin.systemd_service:
+            name: nginx
+            state: stopped
+          when: pgadmin_nginx_running.rc == 3
+
+        - name: Validate the restored configuration
+          ansible.builtin.command: nginx -t
+          changed_when: false
+          when: pgadmin_nginx_live is changed and pgadmin_nginx_running.rc == 0
+
+        - name: Put the restored configuration back into service
+          ansible.builtin.systemd_service:
+            name: nginx
+            state: reloaded
+          when: pgadmin_nginx_live is changed and pgadmin_nginx_running.rc == 0
+
+        - name: Report the failed site activation
+          ansible.builtin.fail:
+            msg: "Nginx deployment failed at {{ ansible_failed_task.name }}. Any replaced site was restored."
+
+  always:
+    - name: Remove private Nginx staging files
+      ansible.builtin.file:
+        path: "{{ pgadmin_nginx_stage.path }}"
+        state: absent
+      changed_when: false

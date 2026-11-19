@@ -1,0 +1,64 @@
+---
+- name: Verify that any existing PostgreSQL cluster can be used safely
+  ansible.builtin.shell: |
+    set -eu
+
+    clusters=''
+    if command -v pg_lsclusters >/dev/null; then
+      clusters=$(pg_lsclusters --no-header)
+    fi
+
+    if [ -z "$clusters" ]; then
+      if pgrep -x postgres >/dev/null; then
+        echo 'An unmanaged PostgreSQL process is already running.'
+        exit 1
+      fi
+      for path in /etc/postgresql /var/lib/postgresql; do
+        if [ -d "$path" ] && [ -n "$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+          echo "Found existing PostgreSQL files without a registered cluster at $path."
+          exit 1
+        fi
+      done
+      if [ -n "$(ss -H -ltn 'sport = :5432')" ] || [ -S /run/postgresql/.s.PGSQL.5432 ]; then
+        echo 'Port 5432 or the standard Unix socket is already in use.'
+        exit 1
+      fi
+      echo absent
+      exit 0
+    fi
+
+    if [ "$(printf '%s\n' "$clusters" | wc -l)" -ne 1 ]; then
+      echo 'Multiple PostgreSQL clusters are present. Select a dedicated target before provisioning.'
+      exit 1
+    fi
+
+    read -r version cluster port status owner data_dir log_file <<CLUSTERS
+    $clusters
+    CLUSTERS
+
+    if [ "$port" != 5432 ] || [ "$owner" != postgres ]; then
+      echo 'Expected a cluster owned by postgres on port 5432.'
+      exit 1
+    fi
+
+    config="/etc/postgresql/$version/$cluster/postgresql.conf"
+    postgres="/usr/lib/postgresql/$version/bin/postgres"
+    listen=$(runuser -u postgres -- "$postgres" -D "$data_dir" -C listen_addresses -c "config_file=$config")
+    start_mode=$(awk '!/^[[:space:]]*(#|$)/ {print $1; exit}' "/etc/postgresql/$version/$cluster/start.conf")
+    if [ "$start_mode" != auto ]; then
+      echo 'The PostgreSQL cluster is not configured for automatic startup.'
+      exit 1
+    fi
+    case "$listen" in
+      localhost|127.0.0.1) ;;
+      *)
+        if ! printf '%s\n' "$listen" | grep -Eq '^(localhost|127\.0\.0\.1)([[:space:]]*,[[:space:]]*)::1$|^::1([[:space:]]*,[[:space:]]*)(127\.0\.0\.1|localhost)$'; then
+          echo 'PostgreSQL must already be configured to listen on IPv4 loopback only, optionally with IPv6 loopback.'
+          exit 1
+        fi
+        ;;
+    esac
+    printf '%s\n' "$version/$cluster"
+  register: postgresql_cluster
+  check_mode: false
+  changed_when: false

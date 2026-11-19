@@ -1,0 +1,7 @@
+---
+stack_common_packages:
+  - acl
+  - ca-certificates
+  - curl
+  - python3.12-venv
+  - python3-psycopg2

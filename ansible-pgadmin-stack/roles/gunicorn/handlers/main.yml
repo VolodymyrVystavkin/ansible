@@ -1,0 +1,6 @@
+---
+- name: Activate pgAdmin service configuration
+  ansible.builtin.systemd_service:
+    name: pgadmin-gunicorn
+    daemon_reload: true
+    state: restarted

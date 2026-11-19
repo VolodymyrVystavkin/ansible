@@ -1,0 +1,12 @@
+---
+pgadmin_server_names:
+  - "{{ inventory_hostname }}"
+  - "{{ ansible_host | default(inventory_hostname) }}"
+pgadmin_use_https: false
+pgadmin_listen_port: 80
+pgadmin_https_port: 443
+pgadmin_tls_certificate: ''
+pgadmin_tls_private_key: ''
+pgadmin_probe_validate_certs: true
+pgadmin_nginx_max_body_size: 50m
+pgadmin_nginx_proxy_timeout: 120

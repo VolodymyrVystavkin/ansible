@@ -1,0 +1,6 @@
+---
+- name: Derive client package and binary directory from the discovered cluster
+  ansible.builtin.set_fact:
+    postgresql_client_major: "{{ postgresql_cluster.stdout.split('/')[0] }}"
+    postgresql_client_bin_dir: "/usr/lib/postgresql/{{ postgresql_cluster.stdout.split('/')[0] }}/bin"
+  when: postgresql_cluster.stdout != 'absent'

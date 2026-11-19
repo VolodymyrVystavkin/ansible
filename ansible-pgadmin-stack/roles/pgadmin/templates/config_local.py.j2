@@ -1,0 +1,37 @@
+# Managed by Ansible
+import os
+
+SERVER_MODE = True
+DEBUG = False
+DATA_DIR = {{ pgadmin_state_dir | to_json }}
+SQLITE_PATH = os.environ.get("PGADMIN_BOOTSTRAP_SQLITE", {{ pgadmin_sqlite | to_json }})
+CONFIG_DATABASE_URI = ""
+SESSION_DB_PATH = os.path.join(DATA_DIR, "sessions")
+STORAGE_DIR = os.path.join(DATA_DIR, "storage")
+KERBEROS_CCACHE_DIR = os.path.join(DATA_DIR, "krbccache")
+AZURE_CREDENTIAL_CACHE_DIR = os.path.join(DATA_DIR, "azurecredentialcache")
+LOG_FILE = {{ (pgadmin_log_dir ~ '/pgadmin4.log') | to_json }}
+APPLICATION_ROOT = "/"
+SESSION_COOKIE_PATH = "/"
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_SECURE = {{ 'True' if pgadmin_use_https | bool else 'False' }}
+SESSION_EXPIRATION_TIME = 1
+PROXY_X_FOR_COUNT = 1
+PROXY_X_PROTO_COUNT = 1
+PROXY_X_HOST_COUNT = 1
+PROXY_X_PORT_COUNT = 0
+PROXY_X_PREFIX_COUNT = 0
+
+# Copy upstream defaults so other versions and EDB retain their preference rows.
+from config import DEFAULT_BINARY_PATHS as _default_binary_paths
+from config import FIXED_BINARY_PATHS as _fixed_binary_paths
+
+DEFAULT_BINARY_PATHS = {
+    **_default_binary_paths,
+    {{ ('pg-' ~ postgresql_client_major) | to_json }}: {{ postgresql_client_bin_dir | to_json }},
+}
+FIXED_BINARY_PATHS = {
+    **_fixed_binary_paths,
+    {{ ('pg-' ~ postgresql_client_major) | to_json }}: {{ postgresql_client_bin_dir | to_json }},
+}

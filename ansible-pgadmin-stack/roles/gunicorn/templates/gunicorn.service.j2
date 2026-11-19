@@ -1,0 +1,30 @@
+# Managed by Ansible
+[Unit]
+Description=Gunicorn for pgAdmin 4
+After=network.target
+ConditionPathExists={{ pgadmin_sqlite }}
+
+[Service]
+Type=simple
+User=pgadmin-web
+Group={{ pgadmin_nginx_worker_group }}
+SupplementaryGroups=pgadmin-web
+WorkingDirectory={{ pgadmin_wheel_app.stdout }}
+Environment=HOME={{ pgadmin_state_dir }}
+Environment=PGADMIN_SERVER_MODE=ON
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart={{ pgadmin_venv }}/bin/gunicorn --bind unix:{{ pgadmin_socket_path }} --umask 0o007 --workers 1 --threads {{ pgadmin_gunicorn_threads | int }} --timeout 120 --access-logfile - --error-logfile - pgAdmin4:app
+RuntimeDirectory=pgadmin-gunicorn
+RuntimeDirectoryMode=0750
+UMask=0077
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{ pgadmin_state_dir }} {{ pgadmin_log_dir }}
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

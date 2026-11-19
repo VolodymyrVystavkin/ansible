@@ -1,0 +1,11 @@
+---
+- name: Verify matching PostgreSQL client tools as the pgAdmin service user
+  ansible.builtin.command:
+    argv: [runuser, -u, pgadmin-web, --, "{{ postgresql_client_bin_dir }}/{{ item }}", --version]
+  loop: [psql, pg_dump, pg_restore, pg_dumpall]
+  register: pgadmin_client_tool
+  changed_when: false
+  failed_when: >-
+    pgadmin_client_tool.rc != 0 or
+    not (pgadmin_client_tool.stdout is search(
+      '[(]PostgreSQL[)] ' ~ (postgresql_client_major | regex_escape) ~ '[.]'))

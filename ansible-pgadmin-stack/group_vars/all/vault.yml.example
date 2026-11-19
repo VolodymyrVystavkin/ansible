@@ -1,0 +1,5 @@
+---
+# Run ansible-vault create group_vars/all/vault.yml and supply your own values.
+# vault_postgresql_lab_password:
+# vault_pgadmin_admin_email:
+# vault_pgadmin_admin_password:

@@ -1,0 +1,33 @@
+---
+- name: Deploy Gunicorn service unit
+  ansible.builtin.template:
+    src: gunicorn.service.j2
+    dest: /etc/systemd/system/pgadmin-gunicorn.service
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+  register: pgadmin_service_unit
+
+- name: Validate Gunicorn service unit
+  ansible.builtin.command: systemd-analyze verify /etc/systemd/system/pgadmin-gunicorn.service
+  changed_when: false
+
+- name: Queue a restart when the application or unit changed
+  ansible.builtin.debug:
+    msg: pgAdmin runtime configuration changed.
+  changed_when: true
+  when: pgadmin_service_unit is changed or pgadmin_config is changed or pgadmin_wheel_installation is changed
+  notify: Activate pgAdmin service configuration
+
+- name: Activate Gunicorn changes before proxy setup
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start Gunicorn
+  ansible.builtin.systemd_service:
+    name: pgadmin-gunicorn
+    enabled: true
+    state: started
+
+- name: Verify the running Gunicorn socket
+  ansible.builtin.import_tasks: verify.yml

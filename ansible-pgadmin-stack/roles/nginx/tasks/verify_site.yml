@@ -1,0 +1,10 @@
+---
+- name: Verify Nginx configuration syntax
+  ansible.builtin.command: nginx -t
+  changed_when: false
+
+- name: Verify login and routing for each configured server name
+  ansible.builtin.include_tasks: verify.yml
+  loop: "{{ pgadmin_server_names | unique }}"
+  loop_control:
+    loop_var: pgadmin_probe_name

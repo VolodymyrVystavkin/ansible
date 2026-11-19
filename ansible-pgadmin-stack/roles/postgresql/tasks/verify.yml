@@ -1,0 +1,30 @@
+---
+- name: Discover the cluster for client verification
+  ansible.builtin.import_tasks: inspect.yml
+
+- name: Require an existing cluster for verification
+  ansible.builtin.assert:
+    that: postgresql_cluster.stdout != 'absent'
+
+- name: Discover the matching PostgreSQL client paths
+  ansible.builtin.import_tasks: client_paths.yml
+
+- name: Verify lab database ownership and login privileges over the local socket
+  become_user: postgres
+  community.postgresql.postgresql_query:
+    login_db: postgres
+    login_user: postgres
+    login_unix_socket: /var/run/postgresql
+    query: >-
+      SELECT d.datname FROM pg_database d JOIN pg_roles r ON d.datdba = r.oid
+      WHERE d.datname = %(database)s AND r.rolname = %(role)s
+        AND current_setting('server_version_num')::int / 10000 = %(major)s::int
+        AND r.rolcanlogin AND r.rolcreatedb AND NOT (r.rolsuper OR r.rolcreaterole
+          OR r.rolreplication OR r.rolbypassrls)
+    named_args:
+      database: "{{ postgresql_lab_database }}"
+      role: "{{ postgresql_lab_user }}"
+      major: "{{ postgresql_client_major }}"
+  register: postgresql_test
+  changed_when: false
+  failed_when: postgresql_test.rowcount | default(0) != 1

@@ -1,0 +1,5 @@
+---
+- name: Reload pgAdmin Nginx configuration
+  ansible.builtin.command: systemctl reload nginx
+  register: pgadmin_nginx_reload
+  failed_when: false

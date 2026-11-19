@@ -1,0 +1,11 @@
+---
+pgadmin_preflight_only: false
+pgadmin_version: '9.19'
+pgadmin_nginx_worker_user: www-data
+pgadmin_nginx_worker_group: www-data
+pgadmin_install_dir: /opt/ansible-pgadmin
+pgadmin_state_dir: /var/lib/ansible-pgadmin
+pgadmin_log_dir: /var/log/ansible-pgadmin
+pgadmin_venv: "{{ pgadmin_install_dir }}/venv"
+pgadmin_sqlite: "{{ pgadmin_state_dir }}/pgadmin4.db"
+pgadmin_min_free_kib: 2097152

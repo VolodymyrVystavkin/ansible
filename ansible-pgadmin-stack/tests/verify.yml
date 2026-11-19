@@ -1,0 +1,44 @@
+---
+- name: Verify the deployed pgAdmin stack
+  hosts: database
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Verify services are active and enabled
+      ansible.builtin.command:
+        argv: [systemctl, "{{ item.0 }}", "{{ item.1 }}"]
+      loop: "{{ ['is-active', 'is-enabled'] | product(['postgresql', 'pgadmin-gunicorn', 'nginx']) | list }}"
+      changed_when: false
+
+    - name: Verify the lab database and role
+      ansible.builtin.import_role:
+        name: postgresql
+        tasks_from: verify
+
+    - name: Verify pgAdmin can run PostgreSQL client utilities
+      ansible.builtin.import_role:
+        name: pgadmin
+        tasks_from: verify_binary_paths
+
+    - name: Verify PostgreSQL and Gunicorn listener boundaries
+      ansible.builtin.shell: |
+        set -eu
+        pg_isready -h 127.0.0.1 -p 5432
+        ss -H -ltn 'sport = :5432' |
+          awk '$4 !~ /^(127\.[0-9.]+|\[::1\]):5432$/ { bad = 1 } END { exit bad }'
+        if ss -H -ltnp | grep -Eq '"(gunicorn|pgadmin[^"]*)"'; then
+          echo 'Found a TCP listener owned by Gunicorn or pgAdmin.'
+          exit 1
+        fi
+      changed_when: false
+
+    - name: Verify the pgAdmin login through the Unix socket
+      ansible.builtin.import_role:
+        name: gunicorn
+        tasks_from: verify
+
+    - name: Verify Nginx and the proxied login
+      ansible.builtin.import_role:
+        name: nginx
+        tasks_from: verify_site

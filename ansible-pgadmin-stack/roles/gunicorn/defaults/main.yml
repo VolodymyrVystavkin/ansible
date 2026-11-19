@@ -1,0 +1,4 @@
+---
+pgadmin_gunicorn_version: '26.2.0'
+pgadmin_gunicorn_threads: 8
+pgadmin_socket_path: /run/pgadmin-gunicorn/pgadmin.sock
